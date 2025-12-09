@@ -1,23 +1,22 @@
 # Генерация поздравительных изображений
 
-Модули для генерации персонализированных поздравительных изображений через API Kandinsky и GigaChat.
+Модуль для генерации персонализированных поздравительных изображений через API GigaChat.
 
 ## Структура проекта
 
 ```
 opdhackatom/
-├── kandinsky_module/       # Модуль для работы с API Kandinsky
-│   ├── __init__.py
-│   ├── kandinsky_module.py  # Базовый модуль API
-│   └── prompt.py            # Формирование промптов и генерация
 ├── gigachat_module/        # Модуль для работы с API GigaChat
 │   ├── __init__.py
 │   ├── gigachat_module.py  # Базовый модуль API
 │   ├── prompt.py           # Формирование промптов и генерация
 │   ├── README.md
 │   └── russian_trusted_root_ca_pem.crt
+├── telegram_bot/          # Telegram бот
+│   ├── __init__.py
+│   └── bot.py             # Основной файл бота
 ├── examples/              # Примеры использования
-│   └── greeting_prompt_example.py
+│   └── gigachat_greeting_example.py
 ├── output/                # Сгенерированные изображения
 │   └── greetings/
 ├── .env                   # API ключи (не в репозитории)
@@ -37,10 +36,6 @@ pip install -r requirements.txt
 Создайте файл `.env` на основе `.env.example` и заполните API ключи:
 
 ```env
-# Kandinsky API
-KANDINSKY_API_KEY=ваш_api_ключ
-KANDINSKY_SECRET_KEY=ваш_secret_ключ
-
 # GigaChat API (один из вариантов)
 GIGACHAT_CREDENTIALS=ваш_ключ_авторизации
 # Или
@@ -48,6 +43,9 @@ GIGACHAT_API_KEY=ваш_api_ключ
 # Или
 GIGACHAT_CLIENT_ID=ваш_client_id
 GIGACHAT_CLIENT_SECRET=ваш_client_secret
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=ваш_токен_бота
 ```
 
 ## Использование модулей
@@ -57,13 +55,12 @@ GIGACHAT_CLIENT_SECRET=ваш_client_secret
 Самый простой способ - использовать функцию `generate_greeting_image()`:
 
 ```python
-from kandinsky_module.prompt import generate_greeting_image
+from gigachat_module.prompt import generate_greeting_image
 
 # Генерируем изображение - передаем все данные одной функцией
 image_path = generate_greeting_image(
-    event_type="новый_год",
     output_path="output/greeting.png",
-    event_date="01.01.2025",
+    event_date="01.01.2025",  # Обязательно - тип события определится автоматически
     client_name="Иван Петров",
     company_name="ООО 'ТехноСтрой'",
     position="Генеральный директор",
@@ -84,16 +81,15 @@ print(f"Изображение сохранено: {image_path}")
 Если нужно сгенерировать несколько изображений, используйте класс:
 
 ```python
-from kandinsky_module.prompt import KandinskyPrompt
+from gigachat_module.prompt import GigaChatPrompt
 
 # Создаем экземпляр (ключи загружаются из .env автоматически)
-prompt_gen = KandinskyPrompt()
+prompt_gen = GigaChatPrompt()
 
 # Генерируем первое изображение
 image_path1 = prompt_gen.generate(
-    event_type="новый_год",
     output_path="output/newyear.png",
-    event_date="01.01.2025",
+    event_date="01.01.2025",  # Тип события определится автоматически (новый_год)
     company_name="ООО 'ТехноСтрой'",
     client_segment="VIP",
     tone="официальный"
@@ -101,35 +97,46 @@ image_path1 = prompt_gen.generate(
 
 # Генерируем второе изображение
 image_path2 = prompt_gen.generate(
-    event_type="день_рождения",
     output_path="output/birthday.png",
-    event_date="15.03.2025",
+    event_date="15.03.2025",  # Тип события определится автоматически (день_рождения)
     company_name="ООО 'МедиаГрупп'",
     client_segment="лояльный",
     tone="дружеский"
 )
 ```
 
+### Способ 3: Telegram бот
+
+Запустите Telegram бота:
+
+```bash
+python telegram_bot/bot.py
+```
+
+Бот будет запрашивать данные для генерации изображения и отправлять результат.
+
 ## Параметры для формирования промпта
 
 ### Обязательные параметры
 
-- **`event_type`** (str): Тип события
-  - `"новый_год"` - Новый год
-  - `"день_рождения"` - День рождения
-  - `"8_марта"` - Международный женский день
-  - `"профессиональный_праздник"` - Профессиональный праздник
-  - `"юбилей"` - Юбилей компании
-  - `"день_компании"` - День основания компании
-
 - **`output_path`** (str): Путь для сохранения изображения
   - Пример: `"output/greeting.png"`
 
+- **`event_date`** (str): Дата события в формате `DD.MM.YYYY` (обязательно)
+  - Пример: `"01.01.2025"` - автоматически определится как "новый_год"
+  - Пример: `"08.03.2025"` - автоматически определится как "8_марта"
+  - Пример: `"15.03.2025"` - автоматически определится как "день_рождения"
+  - Тип события определяется автоматически по дате
+
 ### Опциональные параметры
 
-- **`event_date`** (str): Дата события в формате `DD.MM.YYYY`
-  - Пример: `"01.01.2025"`
-  - Если не указано, используется стандартная дата для события
+- **`event_type`** (str): Тип события (опционально, определяется автоматически по дате)
+  - `"новый_год"` - Новый год (01.01.XXXX)
+  - `"день_рождения"` - День рождения (любая другая дата)
+  - `"8_марта"` - Международный женский день (08.03.XXXX)
+  - `"профессиональный_праздник"` - Профессиональный праздник
+  - `"юбилей"` - Юбилей компании
+  - `"день_компании"` - День основания компании
 
 - **`client_name`** (str): Имя клиента
   - Пример: `"Иван Петров"`
@@ -168,12 +175,11 @@ image_path2 = prompt_gen.generate(
 ### Пример 1: Новый год для VIP-клиента
 
 ```python
-from kandinsky_module.prompt import generate_greeting_image
+from gigachat_module.prompt import generate_greeting_image
 
 image_path = generate_greeting_image(
-    event_type="новый_год",
     output_path="output/newyear_vip.png",
-    event_date="01.01.2025",
+    event_date="01.01.2025",  # Автоматически определится как "новый_год"
     client_name="Иван Петров",
     company_name="ООО 'ТехноСтрой'",
     position="Генеральный директор",
@@ -190,12 +196,11 @@ image_path = generate_greeting_image(
 ### Пример 2: День рождения для нового клиента
 
 ```python
-from kandinsky_module.prompt import generate_greeting_image
+from gigachat_module.prompt import generate_greeting_image
 
 image_path = generate_greeting_image(
-    event_type="день_рождения",
     output_path="output/birthday_new.png",
-    event_date="15.03.2025",
+    event_date="15.03.2025",  # Автоматически определится как "день_рождения"
     client_name="Анна Смирнова",
     company_name="ООО 'МедиаГрупп'",
     position="Финансовый директор",
@@ -212,32 +217,15 @@ image_path = generate_greeting_image(
 ### Пример 3: Минимальный набор данных
 
 ```python
-from kandinsky_module.prompt import generate_greeting_image
+from gigachat_module.prompt import generate_greeting_image
 
 # Минимально необходимые данные
 image_path = generate_greeting_image(
-    event_type="8_марта",
     output_path="output/march8.png",
-    event_date="08.03.2025",
+    event_date="08.03.2025",  # Автоматически определится как "8_марта"
     company_name="ООО 'Цветы'",
     client_segment="лояльный",
     tone="креативный"
-)
-```
-
-### Пример 4: Использование GigaChat API
-
-```python
-from gigachat_module.prompt import generate_greeting_image
-
-# Аналогично Kandinsky, но использует GigaChat API
-image_path = generate_greeting_image(
-    event_type="новый_год",
-    output_path="output/gigachat_newyear.png",
-    event_date="01.01.2025",
-    company_name="ООО 'ТехноСтрой'",
-    client_segment="VIP",
-    tone="официальный"
 )
 ```
 
@@ -269,19 +257,37 @@ image_path = generate_greeting_image(
 ## Запуск примеров
 
 ```bash
-# Пример с Kandinsky API
-python examples/greeting_prompt_example.py
-
 # Пример с GigaChat API
 python examples/gigachat_greeting_example.py
+
+# Запуск Telegram бота
+python telegram_bot/bot.py
 ```
 
-## Разница между Kandinsky и GigaChat
+## Telegram бот
 
-- **Kandinsky**: Промпты на английском языке, быстрая генерация
-- **GigaChat**: Промпты на русском языке, требует сертификат для работы
+Простой Telegram бот для генерации изображений через диалог.
 
-Оба модуля имеют одинаковый интерфейс, можно использовать любой.
+### Установка и запуск
+
+1. Создайте бота через @BotFather в Telegram
+2. Получите токен бота
+3. Добавьте `TELEGRAM_BOT_TOKEN` в `.env` файл
+4. Запустите бота:
+
+```bash
+python telegram_bot/bot.py
+```
+
+### Использование бота
+
+1. Найдите вашего бота в Telegram
+2. Отправьте `/start` для приветствия
+3. Отправьте `/generate` для начала создания изображения
+4. Следуйте инструкциям бота - он будет запрашивать данные пошагово
+5. Получите готовое изображение!
+
+Подробнее см. [telegram_bot/README.md](telegram_bot/README.md)
 
 ## Лицензия
 

@@ -1,12 +1,12 @@
 """
-Простой пример генерации поздравительного изображения
+Пример генерации поздравительного текста через GigaChat API
 
 Демонстрирует:
 - Как передать данные клиента и события
-- Как сформировать промпт автоматически
-- Как получить готовое изображение
+- Как сгенерировать персонализированный текст поздравления
+- Как получить готовый текст через GigaChat
 
-Запуск: python examples/greeting_prompt_example.py
+Запуск: python examples/gigachat_text_example.py
 """
 import sys
 import os
@@ -14,21 +14,15 @@ import os
 # Добавляем корневую директорию проекта в путь
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from kandinsky_module.prompt import generate_greeting_image
+from gigachat_module.text_generator import generate_greeting_text
 
 
 def main():
-    """Пример генерации поздравительного изображения для клиента"""
-    
-    # Создаем директорию для результатов
-    os.makedirs("output/greetings", exist_ok=True)
+    """Пример генерации поздравительного текста для клиента через GigaChat"""
     
     # Данные клиента и события
-    # Примечание: event_type определяется автоматически по event_date
-    # Для 01.01.XXXX -> "новый_год", для 08.03.XXXX -> "8_марта", для остальных -> "день_рождения"
     client_data = {
         "event_date": "01.01.2025",  # Дата события (обязательно) - тип события определится автоматически
-        # "event_type": "новый_год",  # Можно указать явно, если нужно переопределить
         "client_name": "Иван Петров",  # Имя клиента
         "company_name": "ООО 'ТехноСтрой'",  # Название компании
         "position": "Генеральный директор",  # Должность
@@ -41,25 +35,16 @@ def main():
         }
     }
     
-    # Путь для сохранения изображения
-    output_path = "output/greetings/newyear_vip_client.png"
-    
-    print("Генерация поздравительного изображения...")
+    print("Генерация поздравительного текста через GigaChat...")
     print(f"Клиент: {client_data['client_name']}")
     print(f"Компания: {client_data['company_name']}")
     print(f"Дата события: {client_data['event_date']}")
-    if "event_type" in client_data:
-        print(f"Тип события: {client_data['event_type']} (указан явно)")
-    else:
-        print("Тип события: будет определен автоматически по дате")
     print(f"Сегмент: {client_data['client_segment']}, Тон: {client_data['tone']}")
     print()
     
     try:
-        # Генерируем изображение - просто передаем данные и получаем результат
-        # event_type определится автоматически по event_date (01.01.2025 -> "новый_год")
-        image_path = generate_greeting_image(
-            output_path=output_path,
+        # Генерируем текст - просто передаем данные и получаем результат
+        greeting_text = generate_greeting_text(
             event_date=client_data["event_date"],
             event_type=client_data.get("event_type"),  # Опционально - определится по дате
             client_name=client_data["client_name"],
@@ -71,10 +56,18 @@ def main():
             interaction_history=client_data["interaction_history"]
         )
         
-        print(f"✓ Изображение успешно сохранено: {image_path}")
+        print("✓ Текст поздравления успешно сгенерирован:")
+        print()
+        print("-" * 60)
+        print(greeting_text)
+        print("-" * 60)
         
     except Exception as e:
         print(f"✗ Ошибка: {e}")
+        print("\nПроверьте:")
+        print("1. Установлены ли переменные окружения GIGACHAT_CREDENTIALS или GIGACHAT_API_KEY")
+        print("2. Правильность API ключей в файле .env")
+        print("3. Наличие сертификата russian_trusted_root_ca_pem.crt в папке gigachat_module/")
 
 
 if __name__ == "__main__":
