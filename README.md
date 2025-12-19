@@ -9,14 +9,20 @@ opdhackatom/
 ├── gigachat_module/        # Модуль для работы с API GigaChat
 │   ├── __init__.py
 │   ├── gigachat_module.py  # Базовый модуль API
-│   ├── prompt.py           # Формирование промптов и генерация
+│   ├── prompt.py           # Формирование промптов и генерация изображений
+│   ├── text_generator.py   # Генерация текста поздравлений
+│   ├── sincerity_evaluator.py  # Оценка искренности текста
+│   ├── prompt_template.py  # Шаблоны промптов
 │   ├── README.md
 │   └── russian_trusted_root_ca_pem.crt
 ├── telegram_bot/          # Telegram бот
 │   ├── __init__.py
-│   └── bot.py             # Основной файл бота
+│   ├── bot.py             # Основной файл бота
+│   └── README.md
 ├── examples/              # Примеры использования
-│   └── gigachat_greeting_example.py
+│   ├── gigachat_greeting_example.py
+│   ├── gigachat_text_example.py
+│   └── sincerity_evaluation_example.py
 ├── output/                # Сгенерированные изображения
 │   └── greetings/
 ├── .env                   # API ключи (не в репозитории)
@@ -254,11 +260,106 @@ image_path = generate_greeting_image(
    - Предпочтения: учитываются предпочтения клиента
    - История: контекст последнего взаимодействия
 
+## Генерация текста поздравлений
+
+Помимо генерации изображений, модуль поддерживает генерацию персонализированных текстов поздравлений:
+
+```python
+from gigachat_module.text_generator import generate_greeting_text
+
+# Генерация текста поздравления
+greeting_text = generate_greeting_text(
+    event_date="01.01.2025",
+    event_type="новый год",
+    client_name="Иван Петров",
+    company_name="ООО 'ТехноСтрой'",
+    position="Генеральный директор",
+    client_segment="VIP",
+    tone="официальный",
+    preferences=["премиум качество"]
+)
+
+print(greeting_text)
+```
+
+## Оценка искренности текста
+
+Модуль включает функцию оценки искренности генерируемых текстов через GigaChat API. Это позволяет автоматически перегенерировать текст, если он недостаточно искренен.
+
+### Автоматическая оценка и перегенерация
+
+```python
+from gigachat_module.text_generator import generate_greeting_text
+
+# Генерация с автоматической оценкой искренности
+greeting_text = generate_greeting_text(
+    event_date="01.01.2025",
+    event_type="новый год",
+    client_name="Иван Петров",
+    company_name="ООО 'ТехноСтрой'",
+    client_segment="VIP",
+    tone="официальный",
+    evaluate_sincerity=True,  # Включаем оценку искренности
+    min_sincerity=0.6,  # Минимальный порог искренности (0.0-1.0)
+    max_retries=2  # Максимум 2 попытки перегенерации
+)
+```
+
+### Ручная оценка текста
+
+```python
+from gigachat_module.sincerity_evaluator import evaluate_sincerity, is_text_sincere_enough
+
+# Оценка уже сгенерированного текста
+text = "Ваш текст поздравления..."
+
+# Оценка с контекстом
+context = {
+    "event_type": "новый год",
+    "client_segment": "VIP",
+    "tone": "официальный"
+}
+
+scores = evaluate_sincerity(text, context=context)
+print(f"Искренность: {scores['sincerity_score']:.2f}")
+print(f"Теплота: {scores['warmth_score']:.2f}")
+print(f"Персонализация: {scores['personalization_score']:.2f}")
+print(f"Аутентичность: {scores['authenticity_score']:.2f}")
+
+# Проверка, достаточно ли искренен текст
+is_sincere, detailed_scores = is_text_sincere_enough(
+    text,
+    min_sincerity=0.6,
+    context=context
+)
+```
+
+### Метрики оценки
+
+Оценка искренности включает 4 метрики (каждая от 0.0 до 1.0):
+
+- **sincerity_score** - Общая оценка искренности (насколько текст звучит искренне, а не шаблонно)
+- **warmth_score** - Оценка теплоты (насколько текст теплый и дружелюбный)
+- **personalization_score** - Оценка персонализации (насколько текст персонализирован под конкретного клиента)
+- **authenticity_score** - Оценка аутентичности (насколько текст звучит естественно и аутентично)
+
+При использовании `is_text_sincere_enough()` используется взвешенная оценка:
+- sincerity_score × 0.4
+- warmth_score × 0.2
+- personalization_score × 0.2
+- authenticity_score × 0.2
+
 ## Запуск примеров
 
 ```bash
 # Пример с GigaChat API
 python examples/gigachat_greeting_example.py
+
+# Пример генерации текста
+python examples/gigachat_text_example.py
+
+# Пример оценки искренности
+python examples/sincerity_evaluation_example.py
 
 # Запуск Telegram бота
 python telegram_bot/bot.py

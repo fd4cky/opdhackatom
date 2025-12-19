@@ -13,6 +13,12 @@ from .text_generator import (
     generate_greeting_text
 )
 
+from .sincerity_evaluator import (
+    SincerityEvaluator,
+    evaluate_sincerity,
+    is_text_sincere_enough
+)
+
 __all__ = [
     'GigaChatAPI',
     'generate_image_from_prompt',
@@ -20,7 +26,10 @@ __all__ = [
     'GigaChatPrompt',
     'generate_greeting_image',
     'GigaChatTextGenerator',
-    'generate_greeting_text'
+    'generate_greeting_text',
+    'SincerityEvaluator',
+    'evaluate_sincerity',
+    'is_text_sincere_enough'
 ]
 
 # Импортируем официальную библиотеку gigachat

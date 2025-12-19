@@ -9,8 +9,13 @@ Telegram бот для генерации поздравительных изо�
 """
 import os
 import sys
+import asyncio
+import secrets
+import string
+import hashlib
+from functools import partial
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from datetime import datetime
 
 # Добавляем корневую директорию проекта в путь
@@ -24,8 +29,11 @@ except ImportError:
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from gigachat_module.prompt import generate_greeting_image
 from gigachat_module.text_generator import generate_greeting_text
+from database import Database
 
 
 class GreetingBot:
@@ -35,241 +43,718 @@ class GreetingBot:
         """Инициализация бота"""
         self.token = token
         self.application = Application.builder().token(token).build()
+        self.db = Database()
+        self.scheduler = None  # Будет создан в post_init
+        
+        # Загружаем список админов из переменных окружения
+        admin_ids_str = os.getenv("TELEGRAM_ADMIN_IDS", "")
+        self.admin_ids = [int(uid.strip()) for uid in admin_ids_str.split(",") if uid.strip()] if admin_ids_str else []
+        
+        # Состояние бота: режим работы и текущая дата
+        self.auto_mode = True  # True - автоматический режим (+), False - ручной режим (-)
+        self.current_date = None  # Установленная дата (если режим ручной)
+        
         self._setup_handlers()
+        # Настраиваем post_init для создания и запуска планировщика после инициализации event loop
+        self.application.post_init = self._post_init
+    
+    async def _post_init(self, application: Application) -> None:
+        """Вызывается после инициализации event loop"""
+        # Создаем семафор для ограничения количества одновременных запросов к GigaChat API
+        # Ограничиваем до 2 одновременных запросов, чтобы избежать ошибок 429
+        self.gigachat_semaphore = asyncio.Semaphore(2)
+        
+        # Создаем и запускаем планировщик после инициализации event loop
+        self.scheduler = AsyncIOScheduler()
+        self._setup_scheduler()
+        self.scheduler.start()
+        print("📅 Планировщик автоматических поздравлений активирован (проверка каждый день в 9:00)")
+        
+        # Проверяем праздники на текущий день при запуске
+        current_date = datetime.now().strftime("%d.%m.%Y")
+        print(f"🔍 Проверка праздников на текущую дату: {current_date}")
+        await self.check_and_send_greetings_for_date(current_date)
     
     def _setup_handlers(self):
         """Настройка обработчиков команд"""
         # Обработчик команды /start
         start_handler = CommandHandler("start", self.start_command)
         
-        # Обработчик команды /generate
-        generate_handler = CommandHandler("generate", self.generate_command)
-        
-        # Обработчик текстовых сообщений (данные для генерации)
-        data_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_data)
+        # Обработчик текстовых сообщений от админов (управление датой и режимом)
+        admin_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_admin_message)
         
         self.application.add_handler(start_handler)
-        self.application.add_handler(generate_handler)
-        self.application.add_handler(data_handler)
+        self.application.add_handler(admin_handler)
     
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка команды /start"""
-        user = update.effective_user
-        welcome_text = (
-            f"Привет, {user.first_name}! 👋\n\n"
-            f"Я бот для генерации персонализированных поздравительных изображений.\n\n"
-            f"Используй команду /generate чтобы увидеть формат ввода данных.\n\n"
-            f"Затем отправь все данные одним сообщением, разделяя их переносами строк."
-        )
-        await update.message.reply_text(welcome_text)
+    def _is_admin(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь админом"""
+        return user_id in self.admin_ids
     
-    async def generate_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ формата ввода данных"""
-        format_text = (
-            "📝 **Формат ввода данных:**\n\n"
-            "Отправьте все данные одним сообщением, разделяя их переносами строк:\n\n"
-            "1️⃣ **Дата события** (обязательно, формат DD.MM.YYYY)\n"
-            "   Пример: 01.01.2025\n\n"
-            "2️⃣ **Имя клиента** (опционально, можно оставить пустым)\n"
-            "   Пример: Иван Петров\n\n"
-            "3️⃣ **Название компании** (опционально)\n"
-            "   Пример: ООО 'ТехноСтрой'\n\n"
-            "4️⃣ **Должность** (опционально)\n"
-            "   Пример: Генеральный директор\n\n"
-            "5️⃣ **Сегмент клиента** (опционально: VIP, новый, лояльный, стандартный)\n"
-            "   Пример: VIP\n\n"
-            "6️⃣ **Тон** (опционально: официальный, дружеский, креативный)\n"
-            "   Пример: официальный\n\n"
-            "7️⃣ **Предпочтения** (опционально, через запятую)\n"
-            "   Пример: премиум качество, корпоративный стиль\n\n"
-            "8️⃣ **Тип события/праздника** (обязательно)\n"
-            "   Укажите любой тип события или праздника в свободной форме\n"
-            "   Примеры: новый год, день рождения, 8 марта, профессиональный праздник, юбилей, день компании\n\n"
-            "**Пример полного сообщения:**\n"
-            "```\n"
-            "01.01.2025\n"
-            "Иван Петров\n"
-            "ООО 'ТехноСтрой'\n"
-            "Генеральный директор\n"
-            "VIP\n"
-            "официальный\n"
-            "премиум качество, корпоративный стиль\n"
-            "новый год\n"
-            "```\n\n"
-            "💡 **Совет:** Если какое-то поле не нужно, просто оставьте пустую строку."
-        )
-        await update.message.reply_text(format_text, parse_mode="Markdown")
-    
-    def _parse_data(self, text: str) -> Dict:
-        """Парсинг данных из текста, разделенного переносами строк"""
-        lines = [line.strip() for line in text.split('\n')]
-        
-        data = {}
-        
-        # 1. Дата события (обязательно)
-        if len(lines) > 0 and lines[0]:
-            try:
-                datetime.strptime(lines[0], "%d.%m.%Y")
-                data["event_date"] = lines[0]
-            except ValueError:
-                raise ValueError(f"Неверный формат даты: {lines[0]}. Используйте формат DD.MM.YYYY")
-        else:
-            raise ValueError("Дата события обязательна для заполнения")
-        
-        # 2. Имя клиента (опционально)
-        if len(lines) > 1 and lines[1]:
-            data["client_name"] = lines[1]
-        
-        # 3. Название компании (опционально)
-        if len(lines) > 2 and lines[2]:
-            data["company_name"] = lines[2]
-        
-        # 4. Должность (опционально)
-        if len(lines) > 3 and lines[3]:
-            data["position"] = lines[3]
-        
-        # 5. Сегмент клиента (опционально)
-        if len(lines) > 4 and lines[4]:
-            segment = lines[4].lower()
-            valid_segments = ["vip", "новый", "лояльный", "стандартный"]
-            if segment in valid_segments:
-                data["client_segment"] = segment
-            else:
-                data["client_segment"] = "стандартный"
-        else:
-            data["client_segment"] = "стандартный"
-        
-        # 6. Тон (опционально)
-        if len(lines) > 5 and lines[5]:
-            tone = lines[5].lower()
-            valid_tones = ["официальный", "дружеский", "креативный"]
-            if tone in valid_tones:
-                data["tone"] = tone
-            else:
-                data["tone"] = "официальный"
-        else:
-            data["tone"] = "официальный"
-        
-        # 7. Предпочтения (опционально)
-        if len(lines) > 6 and lines[6]:
-            preferences = [p.strip() for p in lines[6].split(",") if p.strip()]
-            if preferences:
-                data["preferences"] = preferences
-        
-        # 8. Тип события/праздника (обязательно) - принимается любой текст
-        if len(lines) > 7 and lines[7]:
-            # Принимаем любой текст как тип события (в свободной форме)
-            data["event_type"] = lines[7].strip()
-        else:
-            raise ValueError("Тип события/праздника обязателен для заполнения (8-й параметр)")
-        
-        return data
-    
-    async def process_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка данных для генерации изображения"""
-        text = update.message.text.strip()
-        
-        # Пропускаем команды
-        if text.startswith('/'):
-            return
-        
-        # Парсим данные
+    def _is_referral_code_unique(self, code: str) -> bool:
+        """Проверяет, уникален ли реферальный код в базе данных"""
         try:
-            data = self._parse_data(text)
-        except ValueError as e:
-            await update.message.reply_text(
-                f"❌ Ошибка в формате данных: {e}\n\n"
-                f"Используйте команду /generate чтобы увидеть правильный формат."
-            )
-            return
+            users = self.db.get_users()
+            for user in users:
+                if user.get('referral_code', '').strip() == code:
+                    return False
+            return True
+        except Exception as e:
+            print(f"[WARNING] Ошибка проверки уникальности кода: {e}")
+            return False
+    
+    def _generate_referral_code(self, user_data: Dict, length: int = 11) -> str:
+        """
+        Генерирует уникальный реферальный код на основе личных данных пользователя
         
-        # Проверяем обязательное поле
-        if "event_date" not in data:
-            await update.message.reply_text(
-                "❌ Ошибка: не указана дата события\n\n"
-                "Используйте команду /generate чтобы увидеть правильный формат."
-            )
-            return
+        Использует комбинацию личных данных пользователя (id, name, birth_date, start_date_bank)
+        и случайной соли для создания уникального кода, который физически не может повториться.
         
-        # Генерируем текст и изображение
-        await update.message.reply_text("🎨 Генерирую поздравление... Это может занять некоторое время...")
+        Args:
+            user_data: Словарь с данными пользователя (id, name, birth_date, start_date_bank)
+            length: Длина кода (10-12 символов, по умолчанию 11)
         
+        Returns:
+            Строка с уникальным реферальным кодом (буквы, цифры, дефисы, подчеркивания)
+        """
+        # Используем буквы (верхний и нижний регистр), цифры, дефис и подчеркивание
+        # Исключаем похожие символы: 0, O, I, l для избежания путаницы
+        alphabet = string.ascii_letters + string.digits + '-_'
+        # Убираем похожие символы
+        alphabet = alphabet.replace('0', '').replace('O', '').replace('o', '')
+        alphabet = alphabet.replace('I', '').replace('l', '')
+        
+        # Извлекаем личные данные пользователя
+        user_id = str(user_data.get('id', ''))
+        name = str(user_data.get('name', ''))
+        birth_date = str(user_data.get('birth_date', ''))
+        start_date_bank = str(user_data.get('start_date_bank', ''))
+        
+        # Создаем уникальную строку из личных данных
+        personal_data = f"{user_id}:{name}:{birth_date}:{start_date_bank}"
+        
+        # Генерируем уникальный код с проверкой на уникальность
+        max_attempts = 100  # Максимальное количество попыток
+        for attempt in range(max_attempts):
+            # Добавляем случайную соль для дополнительной уникальности
+            random_salt = secrets.token_hex(16)
+            
+            # Создаем хеш из комбинации личных данных и соли
+            combined = f"{personal_data}:{random_salt}:{attempt}"
+            hash_obj = hashlib.sha256(combined.encode('utf-8'))
+            hash_hex = hash_obj.hexdigest()
+            
+            # Преобразуем хеш в код нужной длины
+            code_chars = []
+            hash_index = 0
+            
+            for i in range(length):
+                # Используем байты хеша для выбора символа из алфавита
+                if hash_index >= len(hash_hex) - 1:
+                    # Если хеш закончился, добавляем еще случайности
+                    hash_index = 0
+                    random_salt = secrets.token_hex(8)
+                    hash_obj = hashlib.sha256(f"{combined}:{random_salt}".encode('utf-8'))
+                    hash_hex = hash_obj.hexdigest()
+                
+                # Берем два символа хеша и преобразуем в индекс алфавита
+                hex_pair = hash_hex[hash_index:hash_index+2]
+                index = int(hex_pair, 16) % len(alphabet)
+                code_chars.append(alphabet[index])
+                hash_index += 2
+            
+            code = ''.join(code_chars)
+            
+            # Проверяем уникальность кода в базе данных
+            if self._is_referral_code_unique(code):
+                return code
+        
+        # Если не удалось сгенерировать уникальный код за max_attempts попыток,
+        # используем полностью случайный код (крайне маловероятно)
+        code = ''.join(secrets.choice(alphabet) for _ in range(length))
+        if self._is_referral_code_unique(code):
+            return code
+        
+        # В крайнем случае добавляем timestamp для гарантированной уникальности
+        timestamp = str(int(datetime.now().timestamp() * 1000000))[-6:]
+        code = ''.join(secrets.choice(alphabet) for _ in range(length - 6)) + timestamp
+        return code
+    
+    def _find_user_by_referral_code(self, referral_code: str, check_used: bool = True) -> Optional[Dict]:
+        """
+        Находит пользователя по реферальному коду
+        
+        Args:
+            referral_code: Реферальный код для поиска
+            check_used: Проверять ли, был ли код уже использован (если True, вернет None для использованных кодов)
+        
+        Returns:
+            Словарь с данными пользователя или None, если не найден или уже использован
+        """
         try:
-            # Создаем уникальное имя файла
-            output_dir = Path(__file__).parent.parent / "output" / "telegram"
+            user = self.db.get_user_by_referral_code(referral_code)
+            if not user:
+                return None
+            
+            # Если нужно проверить использование и код уже использован (есть chat_id)
+            if check_used:
+                chat_id = user.get('telegram_chat_id', '') or ''
+                if chat_id.strip():
+                    # Код уже использован
+                    return None
+            
+            return user
+        except Exception as e:
+            print(f"[ERROR] Ошибка поиска пользователя по реферальному коду: {e}")
+            return None
+    
+    def _is_referral_code_used(self, referral_code: str) -> bool:
+        """Проверяет, был ли реферальный код уже использован"""
+        try:
+            user = self.db.get_user_by_referral_code(referral_code)
+            if not user:
+                return False
+            
+            chat_id = user.get('telegram_chat_id', '') or ''
+            return bool(chat_id.strip())
+        except Exception as e:
+            print(f"[ERROR] Ошибка проверки использования реферального кода: {e}")
+            return False
+    
+    def _find_user_by_chat_id(self, chat_id: int) -> Optional[Dict]:
+        """Находит пользователя по telegram_chat_id"""
+        try:
+            return self.db.get_user_by_chat_id(chat_id)
+        except Exception as e:
+            print(f"[ERROR] Ошибка поиска пользователя по chat_id: {e}")
+            return None
+    
+    def _save_user_chat_id(self, referral_code: Optional[str] = None, chat_id: Optional[int] = None, 
+                          user_id: Optional[int] = None):
+        """
+        Сохраняет chat_id пользователя в базу данных
+        
+        Args:
+            referral_code: Реферальный код пользователя (приоритетный способ поиска)
+            chat_id: Chat ID пользователя в Telegram
+            user_id: User ID пользователя (резервный способ поиска)
+        
+        Returns:
+            True если успешно сохранено, False иначе
+        """
+        try:
+            success = self.db.update_user_chat_id(
+                user_id=user_id,
+                referral_code=referral_code,
+                chat_id=chat_id
+            )
+            
+            if success:
+                # Получаем имя пользователя для логирования
+                if referral_code:
+                    user = self.db.get_user_by_referral_code(referral_code)
+                elif user_id:
+                    user = self.db.get_user_by_id(user_id)
+                else:
+                    user = None
+                
+                user_name = user.get('name', 'Unknown') if user else 'Unknown'
+                print(f"[INFO] Сохранен chat_id {chat_id} для пользователя {user_name} (код: {referral_code or 'N/A'})")
+            
+            return success
+        except Exception as e:
+            print(f"[WARNING] Не удалось сохранить chat_id: {e}")
+            return False
+    
+    def _setup_scheduler(self):
+        """Настройка планировщика задач для автоматической отправки поздравлений"""
+        # Проверяем праздники каждый день в 9:00 утра
+        # Используем 'async' executor для async функций
+        self.scheduler.add_job(
+            self.check_and_send_greetings,
+            CronTrigger(hour=9, minute=0),
+            id='daily_greetings',
+            name='Ежедневная проверка и отправка поздравлений',
+            executor='default'
+        )
+    
+    def _get_current_date(self) -> str:
+        """Получает текущую дату в зависимости от режима"""
+        if self.auto_mode:
+            # Автоматический режим - используем текущую дату
+            return datetime.now().strftime("%d.%m.%Y")
+        else:
+            # Ручной режим - используем установленную дату
+            if self.current_date:
+                return self.current_date
+            else:
+                # Если дата не установлена, используем текущую
+                return datetime.now().strftime("%d.%m.%Y")
+    
+    async def check_and_send_greetings(self):
+        """Проверяет праздники и дни рождения на текущую дату и отправляет поздравления"""
+        current_date = self._get_current_date()
+        print(f"[INFO] Проверка праздников на {current_date} (режим: {'автоматический' if self.auto_mode else 'ручной'})...")
+        
+        await self.check_and_send_greetings_for_date(current_date)
+    
+    async def check_and_send_greetings_for_date(self, date_str: str):
+        """Проверяет праздники и дни рождения на указанную дату и отправляет поздравления"""
+        # Конвертируем дату в нужные форматы
+        try:
+            date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+            date_yyyy_mm_dd = date_obj.strftime("%Y-%m-%d")
+            date_dd_mm = date_obj.strftime("%d.%m")
+        except ValueError:
+            print(f"[ERROR] Неверный формат даты: {date_str}")
+            return
+        
+        # Получаем дни рождения на эту дату
+        birthdays = self.db.get_users_by_birthday(date_dd_mm)
+        
+        # Получаем праздники на эту дату
+        holidays = self.db.get_holidays_by_date(date_yyyy_mm_dd)
+        
+        # Обрабатываем дни рождения параллельно
+        birthday_tasks = []
+        for user in birthdays:
+            chat_id = user.get('telegram_chat_id', '').strip()
+            
+            # Используем только chat_id
+            if not chat_id:
+                print(f"[WARNING] Пропущен пользователь {user.get('name', 'Unknown')}: нет chat_id (пользователь не активирован)")
+                continue
+            
+            # Создаем задачу для параллельного выполнения
+            task = asyncio.create_task(
+                self._send_birthday_greeting_safe(user, chat_id, date_str)
+            )
+            birthday_tasks.append(task)
+        
+        # Ждем завершения всех задач дней рождения параллельно
+        if birthday_tasks:
+            await asyncio.gather(*birthday_tasks, return_exceptions=True)
+        
+        # Обрабатываем праздники
+        users_by_holiday = {}
+        for holiday in holidays:
+            holiday_id = holiday.get('id', '')
+            users = self.db.get_users_for_holiday(holiday, date_yyyy_mm_dd)
+            users_by_holiday[holiday_id] = users
+        
+        # Обрабатываем праздники параллельно
+        holiday_tasks = []
+        for holiday in holidays:
+            holiday_id = holiday.get('id', '')
+            users = users_by_holiday.get(holiday_id, [])
+            
+            for user in users:
+                chat_id = user.get('telegram_chat_id', '').strip()
+                
+                # Используем только chat_id
+                if not chat_id:
+                    print(f"[WARNING] Пропущен пользователь {user.get('name', 'Unknown')}: нет chat_id (пользователь не активирован)")
+                    continue
+                
+                # Создаем задачу для параллельного выполнения
+                task = asyncio.create_task(
+                    self._send_holiday_greeting_safe(user, holiday, chat_id, date_str)
+                )
+                holiday_tasks.append(task)
+        
+        # Ждем завершения всех задач праздников параллельно
+        if holiday_tasks:
+            await asyncio.gather(*holiday_tasks, return_exceptions=True)
+        
+        print(f"[INFO] Проверка завершена. Обработано {len(birthdays)} дней рождения и {len(holidays)} праздников.")
+    
+    async def _send_birthday_greeting_safe(self, user: Dict, chat_id: str, event_date_str: str):
+        """Безопасная обертка для отправки поздравления с днем рождения с обработкой ошибок"""
+        try:
+            await self.send_birthday_greeting(user, chat_id, event_date_str)
+        except Exception as e:
+            print(f"[ERROR] Ошибка отправки поздравления с днем рождения пользователю {chat_id}: {e}")
+            raise
+    
+    async def _send_holiday_greeting_safe(self, user: Dict, holiday: Dict, chat_id: str, event_date_str: str):
+        """Безопасная обертка для отправки поздравления с праздником с обработкой ошибок"""
+        try:
+            await self.send_holiday_greeting(user, holiday, chat_id, event_date_str)
+        except Exception as e:
+            holiday_name = holiday.get('holiday_name', 'Unknown')
+            print(f"[ERROR] Ошибка отправки поздравления с праздником '{holiday_name}' пользователю {chat_id}: {e}")
+            raise
+    
+    async def send_birthday_greeting(self, user: Dict, chat_id_or_username: str, event_date_str: str):
+        """Отправляет поздравление с днем рождения пользователю"""
+        # Извлекаем данные пользователя
+        name = user.get('name', '')
+        birth_date = user.get('birth_date', '')
+        user_type = user.get('user_type', 'client')
+        interests = user.get('interests', '')
+        
+        # Определяем сегмент на основе типа пользователя
+        client_segment = "VIP" if user_type == "employee" else "лояльный"
+        
+        # Используем переданную дату события
+        event_date = event_date_str
+        
+        # Генерируем поздравление
+        try:
+            # Генерируем текст и изображение в отдельном потоке, чтобы не блокировать event loop
+            output_dir = Path(__file__).parent.parent / "output" / "telegram" / "auto"
             output_dir.mkdir(parents=True, exist_ok=True)
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            client_name_safe = data.get("client_name", "client").replace(" ", "_")
-            output_path = output_dir / f"{client_name_safe}_{timestamp}.png"
+            name_safe = name.replace(" ", "_")
+            output_path = output_dir / f"birthday_{name_safe}_{timestamp}.png"
             
-            # Генерируем текст поздравления
-            greeting_text = None
-            try:
-                greeting_text = generate_greeting_text(
-                    event_date=data["event_date"],
-                    event_type=data.get("event_type"),
-                    client_name=data.get("client_name"),
-                    company_name=data.get("company_name"),
-                    position=data.get("position"),
-                    client_segment=data.get("client_segment", "стандартный"),
-                    tone=data.get("tone", "официальный"),
-                    preferences=data.get("preferences"),
-                    interaction_history=data.get("interaction_history")
+            # Выполняем генерацию в отдельном потоке с ограничением через семафор
+            loop = asyncio.get_event_loop()
+            
+            async def generate_with_semaphore(func):
+                async with self.gigachat_semaphore:
+                    await asyncio.sleep(0.3)  # Небольшая задержка между запросами
+                    return await loop.run_in_executor(None, func)
+            
+            greeting_text, image_path = await asyncio.gather(
+                generate_with_semaphore(
+                    partial(
+                        generate_greeting_text,
+                        event_date=event_date,
+                        event_type="день рождения",
+                        client_name=name,
+                        client_segment=client_segment,
+                        tone="дружеский",
+                        preferences=[interests] if interests else None,
+                        evaluate_sincerity=True,
+                        min_sincerity=0.6
+                    )
+                ),
+                generate_with_semaphore(
+                    partial(
+                        generate_greeting_image,
+                        output_path=str(output_path),
+                        event_date=event_date,
+                        event_type="день рождения",
+                        client_name=name,
+                        client_segment=client_segment,
+                        tone="дружеский",
+                        preferences=[interests] if interests else None
+                    )
                 )
-            except Exception as text_error:
-                print(f"[ERROR] Text generation failed: {text_error}")
-                # Продолжаем генерацию изображения даже если текст не сгенерировался
-                greeting_text = "Поздравляем с праздником!"
-            
-            # Генерируем изображение
-            image_path = generate_greeting_image(
-                output_path=str(output_path),
-                event_date=data["event_date"],
-                event_type=data.get("event_type"),
-                client_name=data.get("client_name"),
-                company_name=data.get("company_name"),
-                position=data.get("position"),
-                client_segment=data.get("client_segment", "стандартный"),
-                tone=data.get("tone", "официальный"),
-                preferences=data.get("preferences"),
-                interaction_history=data.get("interaction_history")
             )
             
-            # Отправляем изображение с текстом в подписи
+            # Отправляем сообщение пользователю
+            # Отправляем изображение с текстом
             with open(image_path, "rb") as photo:
-                caption = "✅ Поздравительное изображение сгенерировано!"
-                if greeting_text:
-                    # Ограничиваем длину подписи (Telegram ограничивает до 1024 символов)
-                    # Берем полный текст, но обрезаем если слишком длинный
-                    max_length = 1024 - 10  # Оставляем запас
-                    if len(greeting_text) > max_length:
-                        caption = greeting_text[:max_length-3] + "..."
-                    else:
-                        caption = greeting_text
+                max_length = 1024 - 10
+                caption = greeting_text[:max_length-3] + "..." if len(greeting_text) > max_length else greeting_text
                 
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption=caption
-                )
+                try:
+                    # Определяем chat_id: если это число, используем как есть, иначе добавляем @
+                    if chat_id_or_username.isdigit():
+                        chat_id = int(chat_id_or_username)
+                    else:
+                        chat_id = f"@{chat_id_or_username}"
+                    
+                    await self.application.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                    print(f"[INFO] ✅ Отправлено поздравление с днем рождения пользователю {chat_id}")
+                except Exception as send_error:
+                    error_msg = str(send_error).lower()
+                    if "chat not found" in error_msg or "user not found" in error_msg:
+                        print(f"[WARNING] Пользователь {chat_id_or_username} не найден или не начал диалог с ботом")
+                    else:
+                        print(f"[ERROR] Ошибка отправки сообщения пользователю {chat_id_or_username}: {send_error}")
+                    raise
             
         except Exception as e:
-            # Пишем ошибку в логи для отладки
-            import traceback
-            print(f"[ERROR] Generation failed: {e}")
-            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            print(f"[ERROR] Ошибка генерации поздравления с днем рождения для {chat_id_or_username}: {e}")
+            # Не пробрасываем исключение дальше, чтобы не прерывать обработку других пользователей
+    
+    async def send_holiday_greeting(self, user: Dict, holiday: Dict, chat_id_or_username: str, event_date_str: str):
+        """Отправляет поздравление с праздником пользователю"""
+        # Извлекаем данные
+        name = user.get('name', '')
+        user_type = user.get('user_type', 'client')
+        position = user.get('position', '')
+        interests = user.get('interests', '')
+        
+        holiday_name = holiday.get('holiday_name', '')
+        
+        # Определяем сегмент
+        client_segment = "VIP" if user_type == "employee" else "лояльный"
+        
+        # Используем переданную дату события
+        event_date = event_date_str
+        
+        # Определяем тон в зависимости от праздника
+        tone = "официальный"
+        if "женский день" in holiday_name.lower() or "8" in holiday_name:
+            tone = "дружеский"
+        elif "новый год" in holiday_name.lower():
+            tone = "креативный"
+        
+        try:
+            # Генерируем текст и изображение в отдельном потоке, чтобы не блокировать event loop
+            output_dir = Path(__file__).parent.parent / "output" / "telegram" / "auto"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            name_safe = name.replace(" ", "_")
+            holiday_safe = holiday_name.replace(" ", "_").replace("/", "_")
+            output_path = output_dir / f"holiday_{holiday_safe}_{name_safe}_{timestamp}.png"
+            
+            # Выполняем генерацию в отдельном потоке с ограничением через семафор
+            loop = asyncio.get_event_loop()
+            
+            async def generate_with_semaphore(func):
+                async with self.gigachat_semaphore:
+                    await asyncio.sleep(0.3)  # Небольшая задержка между запросами
+                    return await loop.run_in_executor(None, func)
+            
+            greeting_text, image_path = await asyncio.gather(
+                generate_with_semaphore(
+                    partial(
+                        generate_greeting_text,
+                        event_date=event_date,
+                        event_type=holiday_name,
+                        client_name=name,
+                        position=position if position else None,
+                        client_segment=client_segment,
+                        tone=tone,
+                        preferences=[interests] if interests else None,
+                        evaluate_sincerity=True,
+                        min_sincerity=0.6
+                    )
+                ),
+                generate_with_semaphore(
+                    partial(
+                        generate_greeting_image,
+                        output_path=str(output_path),
+                        event_date=event_date,
+                        event_type=holiday_name,
+                        client_name=name,
+                        position=position if position else None,
+                        client_segment=client_segment,
+                        tone=tone,
+                        preferences=[interests] if interests else None
+                    )
+                )
+            )
+            
+            # Отправляем сообщение пользователю
+            # Отправляем изображение с текстом
+            with open(image_path, "rb") as photo:
+                max_length = 1024 - 10
+                caption = greeting_text[:max_length-3] + "..." if len(greeting_text) > max_length else greeting_text
+                
+                try:
+                    # Определяем chat_id: если это число, используем как есть, иначе добавляем @
+                    if chat_id_or_username.isdigit():
+                        chat_id = int(chat_id_or_username)
+                    else:
+                        chat_id = f"@{chat_id_or_username}"
+                    
+                    await self.application.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=caption,
+                        parse_mode="HTML"
+                    )
+                    print(f"[INFO] ✅ Отправлено поздравление с праздником '{holiday_name}' пользователю {chat_id}")
+                except Exception as send_error:
+                    error_msg = str(send_error).lower()
+                    if "chat not found" in error_msg or "user not found" in error_msg:
+                        print(f"[WARNING] Пользователь {chat_id_or_username} не найден или не начал диалог с ботом")
+                    else:
+                        print(f"[ERROR] Ошибка отправки сообщения пользователю {chat_id_or_username}: {send_error}")
+                    raise
+            
+        except Exception as e:
+            print(f"[ERROR] Ошибка генерации поздравления с праздником для {chat_id_or_username}: {e}")
+            # Не пробрасываем исключение дальше, чтобы не прерывать обработку других пользователей
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка команды /start с поддержкой реферальных кодов"""
+        user = update.effective_user
+        user_id = user.id
+        chat_id = update.effective_chat.id
+        
+        # Получаем реферальный код из параметров команды (deep linking: /start CODE)
+        referral_code = None
+        if context.args and len(context.args) > 0:
+            referral_code = context.args[0].strip()
+        
+        # Если есть реферальный код, ищем пользователя и сохраняем chat_id
+        if referral_code:
+            # Проверяем, был ли код уже использован
+            if self._is_referral_code_used(referral_code):
+                await update.message.reply_text(
+                    "❌ Этот реферальный код уже был использован.\n\n"
+                    "Каждый код можно использовать только один раз.\n"
+                    "Обратитесь к администратору за новым кодом."
+                )
+                return
+            
+            # Ищем пользователя по коду (проверяем, что код не использован)
+            user_data = self._find_user_by_referral_code(referral_code, check_used=True)
+            if user_data:
+                # Сохраняем chat_id для найденного пользователя
+                success = self._save_user_chat_id(
+                    referral_code=referral_code,
+                    chat_id=chat_id
+                )
+                
+                if success:
+                    user_name = user_data.get('name', 'Пользователь')
+                    welcome_text = (
+                        f"Привет, {user.first_name}! 👋\n\n"
+                        f"Вы успешно активированы как {user_name}.\n\n"
+                        f"Бот будет автоматически отправлять вам поздравления в дни ваших праздников.\n\n"
+                        f"✅ Реферальный код активирован и больше не может быть использован."
+                    )
+                    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+                    return
+                else:
+                    await update.message.reply_text(
+                        "❌ Ошибка при активации кода. Попробуйте позже или обратитесь к администратору."
+                    )
+                    return
+            else:
+                # Неверный реферальный код
+                await update.message.reply_text(
+                    "❌ Неверный реферальный код.\n\n"
+                    "Пожалуйста, используйте ссылку, предоставленную вам администратором."
+                )
+                return
+        
+        # Если нет реферального кода, проверяем админа
+        if self._is_admin(user_id):
+            # Админы могут использовать бот без реферального кода
+            self._save_user_chat_id(user_id=user_id, chat_id=chat_id)
+            welcome_text = (
+                f"Привет, {user.first_name}! 👋\n\n"
+                f"Вы администратор бота.\n\n"
+                f"**Доступные команды:**\n\n"
+                f"📅 **Установить дату:** отправьте дату в формате DD.MM.YYYY\n"
+                f"   Пример: 01.01.2025\n\n"
+                f"➕ **Автоматический режим:** отправьте +\n"
+                f"   Бот будет использовать текущую дату\n\n"
+                f"➖ **Ручной режим:** отправьте -\n"
+                f"   Бот будет использовать установленную дату\n\n"
+                f"**Текущий режим:** {'Автоматический (+)' if self.auto_mode else 'Ручной (-)'}\n"
+            )
+            if not self.auto_mode and self.current_date:
+                welcome_text += f"**Установленная дата:** {self.current_date}\n"
+            else:
+                welcome_text += f"**Текущая дата:** {datetime.now().strftime('%d.%m.%Y')}\n"
+        else:
+            # Обычный пользователь без реферального кода
+            # Проверяем, привязан ли пользователь (есть ли chat_id в базе)
+            user_data = self._find_user_by_chat_id(chat_id)
+            if user_data:
+                # Пользователь уже привязан
+                user_name = user_data.get('name', 'Пользователь')
+                welcome_text = (
+                    f"Привет, {user.first_name}! 👋\n\n"
+                    f"Вы уже активированы как {user_name}.\n\n"
+                    f"Бот будет автоматически отправлять вам поздравления в дни ваших праздников."
+                )
+            else:
+                # Пользователь не привязан - нужен реферальный код
+                welcome_text = (
+                    f"Привет, {user.first_name}! 👋\n\n"
+                    f"Для использования бота вам необходим реферальный код.\n\n"
+                    f"Пожалуйста, используйте ссылку, предоставленную вам администратором."
+                )
+        
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    
+    async def handle_admin_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка сообщений от админов"""
+        user = update.effective_user
+        user_id = user.id
+        
+        # Проверяем, является ли пользователь админом
+        # Если не админ - просто игнорируем сообщение без ответа
+        if not self._is_admin(user_id):
+            return
+        
+        text = update.message.text.strip()
+        
+        # Обработка команд
+        if text == "+":
+            # Автоматический режим
+            self.auto_mode = True
+            self.current_date = None
             await update.message.reply_text(
-                f"❌ Ошибка при генерации поздравления: {e}\n\n"
-                f"Проверьте:\n"
-                f"1. Правильность API ключей GigaChat в .env\n"
-                f"2. Подключение к интернету\n"
-                f"3. Попробуйте еще раз, используя команду /generate для просмотра формата"
+                "✅ **Автоматический режим активирован**\n\n"
+                f"Бот будет использовать текущую дату: {datetime.now().strftime('%d.%m.%Y')}"
+            )
+            return
+        
+        elif text == "-":
+            # Ручной режим
+            self.auto_mode = False
+            if self.current_date:
+                await update.message.reply_text(
+                    f"✅ **Ручной режим активирован**\n\n"
+                    f"Текущая установленная дата: {self.current_date}\n\n"
+                    f"Отправьте дату в формате DD.MM.YYYY для установки новой даты."
+                )
+            else:
+                await update.message.reply_text(
+                    "✅ **Ручной режим активирован**\n\n"
+                    "Отправьте дату в формате DD.MM.YYYY для установки даты."
+                )
+            return
+        
+        # Проверяем, является ли сообщение датой в формате DD.MM.YYYY
+        try:
+            parsed_date = datetime.strptime(text, "%d.%m.%Y")
+            # Устанавливаем дату
+            self.current_date = text
+            self.auto_mode = False  # При установке даты автоматически переключаемся в ручной режим
+            
+            # Проверяем праздники на эту дату и отправляем поздравления
+            await update.message.reply_text(
+                f"✅ **Дата установлена:** {text}\n"
+                f"**Режим:** Ручной (-)\n\n"
+                f"🔍 Проверяю праздники на эту дату..."
+            )
+            
+            # Отправляем поздравления
+            await self.check_and_send_greetings_for_date(text)
+            
+            await update.message.reply_text("✅ Проверка завершена! См. логи для деталей.")
+            
+        except ValueError:
+            # Не является датой
+            await update.message.reply_text(
+                "❌ Неверный формат команды.\n\n"
+                "**Доступные команды:**\n"
+                "• `+` - автоматический режим\n"
+                "• `-` - ручной режим\n"
+                "• `DD.MM.YYYY` - установить дату (например: 01.01.2025)",
+                parse_mode="Markdown"
             )
     
     def run(self):
         """Запуск бота"""
         print("🤖 Бот запущен! Нажмите Ctrl+C для остановки.")
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        try:
+            # Запускаем бота (планировщик запустится через post_init после создания event loop)
+            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        finally:
+            # Останавливаем планировщик при остановке бота
+            if self.scheduler and self.scheduler.running:
+                self.scheduler.shutdown()
 
 
 def main():
@@ -286,6 +771,18 @@ def main():
         print("4. Скопируйте полученный токен")
         print("5. Добавьте в .env файл: TELEGRAM_BOT_TOKEN=ваш_токен")
         return
+    
+    # Проверяем наличие админов
+    admin_ids_str = os.getenv("TELEGRAM_ADMIN_IDS", "")
+    if not admin_ids_str:
+        print("⚠️  Внимание: TELEGRAM_ADMIN_IDS не установлен в .env файле")
+        print("\nДля получения ID пользователя:")
+        print("1. Найдите бота @userinfobot в Telegram")
+        print("2. Отправьте ему любое сообщение")
+        print("3. Скопируйте ваш ID (число)")
+        print("4. Добавьте в .env файл: TELEGRAM_ADMIN_IDS=ваш_id")
+        print("\nДля нескольких админов используйте запятую: TELEGRAM_ADMIN_IDS=123456789,987654321")
+        print("\nБот будет работать, но только админы смогут управлять датой.")
     
     # Создаем и запускаем бота
     bot = GreetingBot(token)

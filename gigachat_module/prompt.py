@@ -5,6 +5,7 @@
 from typing import Optional, Dict, List
 from datetime import datetime
 from .gigachat_module import GigaChatAPI, load_api_keys_from_env
+from .prompt_template import build_image_prompt, build_simple_image_prompt
 
 
 def _detect_event_type_from_date(event_date: str) -> Optional[str]:
@@ -70,10 +71,19 @@ class GigaChatPrompt:
         # Если ключи не переданы, загружаем из .env
         if not credentials and not api_key and (not client_id or not client_secret):
             env_credentials, env_api_key, env_client_id, env_client_secret = load_api_keys_from_env()
-            credentials = credentials or env_credentials or env_api_key
-            api_key = api_key or env_api_key
-            client_id = client_id or env_client_id
-            client_secret = client_secret or env_client_secret
+            
+            # Приоритет: API_KEY/CREDENTIALS > client_id/client_secret
+            # Если есть API_KEY или CREDENTIALS, используем их и игнорируем client_id/client_secret
+            if env_credentials or env_api_key:
+                credentials = credentials or env_credentials or env_api_key
+                api_key = api_key or env_api_key
+                # Не используем client_id/client_secret, если есть API_KEY
+                client_id = None
+                client_secret = None
+            else:
+                # Используем client_id/client_secret только если нет API_KEY
+                client_id = client_id or env_client_id
+                client_secret = client_secret or env_client_secret
         
         self.api = GigaChatAPI(
             credentials=credentials,
@@ -175,59 +185,43 @@ class GigaChatPrompt:
             "стандартный": "профессиональный, дружелюбный, высокое качество"
         }
         
-        # Формируем упрощенный промпт для GigaChat
-        # GigaChat лучше работает с короткими и простыми промптами
-        prompt_parts = []
+        # Используем универсальный шаблон-конструктор для генерации промпта
+        # Определяем название праздника
+        holiday_name = event_type if event_type else "праздник"
         
-        # Основные элементы события (самое важное)
-        # Пробуем найти в словаре по нормализованному ключу
-        if event_type_normalized and event_type_normalized in event_elements:
-            prompt_parts.append(event_elements[event_type_normalized])
-        elif event_type:
-            # Если тип события не в словаре, используем его как есть в промпте
-            prompt_parts.append(f"праздник: {event_type}, праздничная атмосфера")
+        # Используем шаблон-конструктор для формирования промпта
+        prompt = build_image_prompt(
+            holiday_name=holiday_name,
+            profession=position,
+            company_name=company_name,
+            client_status=client_segment,
+            preferences=preferences,
+            tone=tone
+        )
         
-        # Стиль (упрощенный)
-        if tone == "официальный":
-            prompt_parts.append("корпоративный стиль, элегантный")
-        elif tone == "дружеский":
-            prompt_parts.append("теплый, дружелюбный")
-        elif tone == "креативный":
-            prompt_parts.append("креативный, яркий")
-        
-        # Сегмент (только ключевые слова)
-        if client_segment == "VIP":
-            prompt_parts.append("премиум, роскошь")
-        elif client_segment == "новый":
-            prompt_parts.append("приветливый")
-        elif client_segment == "лояльный":
-            prompt_parts.append("благодарность")
-        
-        # Компания (только название, без лишних слов)
-        if company_name:
-            # Убираем кавычки и лишние символы
-            clean_company = company_name.replace("'", "").replace('"', '').replace("ООО", "").strip()
-            if clean_company:
-                prompt_parts.append(f"компания {clean_company}")
-        
-        # Объединяем в короткий промпт
-        prompt = ", ".join(prompt_parts)
-        
-        # Если промпт получился слишком длинным, обрезаем до первых 3-4 элементов
-        if len(prompt_parts) > 4:
-            prompt = ", ".join(prompt_parts[:4])
-        
-        # ВАЖНО: Добавляем строгое указание, что на изображении НЕ ДОЛЖНО быть текста
-        # Это критическое требование - только визуальные элементы, никакого текста
-        prompt = f"ВАЖНО: НЕ ДОБАВЛЯЙ ТЕКСТ НА ИЗОБРАЖЕНИЕ. {prompt}, только визуальные элементы, БЕЗ ТЕКСТА, БЕЗ НАДПИСЕЙ, БЕЗ СЛОВ, БЕЗ БУКВ, БЕЗ ЦИФР, БЕЗ ПОДПИСЕЙ, БЕЗ ЛОГОТИПОВ С ТЕКСТОМ"
-        
-        # Генерируем изображение с усиленным негативным промптом, исключающим текст
+        # Генерируем изображение с максимально усиленным негативным промптом, исключающим текст и людей
+        negative_prompt_text = (
+            "текст, надписи, слова, буквы, цифры, подписи, логотипы с текстом, "
+            "любой текст, любые надписи, любые слова, любые буквы, любые цифры, "
+            "текст на изображении, надписи на изображении, слова на изображении, "
+            "буквы на изображении, цифры на изображении, подписи на изображении, "
+            "текстовые элементы, текстовые надписи, текстовые символы, "
+            "любые текстовые элементы, любые текстовые надписи, любые текстовые символы, "
+            "текст вообще, любой текст, текст в любом виде, текст в любом формате, "
+            "надписи в любом виде, слова в любом виде, буквы в любом виде, "
+            "цифры в любом виде, подписи в любом виде, логотипы с текстом, "
+            "текст на русском, текст на английском, текст на любом языке, "
+            "люди, человек, человеческие фигуры, лица, портреты, силуэты людей, персонажи, персонаж, "
+            "люди вообще, любые люди, люди в любом виде, человеческие фигуры в любом виде, "
+            "лица в любом виде, портреты в любом виде, силуэты в любом виде, "
+            "люди на изображении, человеческие фигуры на изображении, лица на изображении"
+        )
         return self.api.generate_and_save(
             prompt=prompt,
             output_path=output_path,
             width=1024,
             height=1024,
-            negative_prompt="текст, надписи, слова, буквы, цифры, подписи, логотипы с текстом, любой текст, любые надписи, любые слова, любые буквы, любые цифры, текст на изображении, надписи на изображении"
+            negative_prompt=negative_prompt_text
         )
 
 
