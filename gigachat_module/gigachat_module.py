@@ -3,7 +3,6 @@
 Использует официальную библиотеку gigachat
 """
 import os
-import time
 from typing import Optional, Union
 from pathlib import Path
 
@@ -175,45 +174,8 @@ class GigaChatAPI:
             response = self.client.chat(chat_payload)
         except Exception as e:
             error_msg = str(e).lower()
-            
-            # Проверяем, является ли это ошибкой rate limit (429)
-            is_rate_limit = '429' in error_msg or 'too many requests' in error_msg
-            if isinstance(e, tuple) and len(e) >= 2:
-                is_rate_limit = is_rate_limit or e[1] == 429
-            
-            if is_rate_limit:
-                # Ошибка 429 - пробуем с задержкой
-                max_retries = 5  # Увеличено количество попыток
-                for attempt in range(max_retries):
-                    delay = 5.0 * (2 ** attempt)  # Экспоненциальная задержка: 5, 10, 20, 40, 80 секунд
-                    delay = min(delay, 120.0)  # Максимум 120 секунд
-                    print(f"[WARNING] Ошибка 429 (Too Many Requests) при генерации изображения, попытка {attempt + 1}/{max_retries}")
-                    print(f"[INFO] Ожидание {delay:.1f} секунд перед повторной попыткой...")
-                    time.sleep(delay)
-                    
-                    try:
-                        response = self.client.chat(chat_payload)
-                        break  # Успешно, выходим из цикла
-                    except Exception as retry_error:
-                        # Проверяем, это снова 429 или другая ошибка
-                        retry_error_msg = str(retry_error).lower()
-                        is_retry_rate_limit = '429' in retry_error_msg or 'too many requests' in retry_error_msg
-                        if isinstance(retry_error, tuple) and len(retry_error) >= 2:
-                            is_retry_rate_limit = is_retry_rate_limit or retry_error[1] == 429
-                        
-                        if is_retry_rate_limit and attempt >= max_retries - 1:
-                            raise Exception(
-                                f"Ошибка 429 (Too Many Requests) при генерации изображения после {max_retries} попыток.\n"
-                                f"Возможно, исчерпана квота токенов или превышен rate limit.\n"
-                                f"Попробуйте позже или проверьте квоту API."
-                            )
-                        elif not is_retry_rate_limit:
-                            # Другая ошибка, пробрасываем дальше
-                            raise retry_error
-                        # Иначе продолжаем цикл
-                        continue
             # Если ошибка соединения, пробуем еще раз
-            elif "connection" in error_msg or "reset" in error_msg or "peer" in error_msg:
+            if "connection" in error_msg or "reset" in error_msg or "peer" in error_msg:
                 # Пробуем еще раз с простым запросом
                 try:
                     from gigachat.models import Chat, Messages, MessagesRole

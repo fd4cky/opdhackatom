@@ -41,3 +41,7 @@ output/**/*.jpeg
 output/**/*.gif
 output/**/*.webp
 
+# База данных SQLite
+database.db
+*.db
+

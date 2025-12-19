@@ -13,7 +13,6 @@ import asyncio
 import secrets
 import string
 import hashlib
-from functools import partial
 from pathlib import Path
 from typing import Dict, Optional, List
 from datetime import datetime
@@ -60,20 +59,11 @@ class GreetingBot:
     
     async def _post_init(self, application: Application) -> None:
         """Вызывается после инициализации event loop"""
-        # Создаем семафор для ограничения количества одновременных запросов к GigaChat API
-        # Ограничиваем до 2 одновременных запросов, чтобы избежать ошибок 429
-        self.gigachat_semaphore = asyncio.Semaphore(2)
-        
         # Создаем и запускаем планировщик после инициализации event loop
         self.scheduler = AsyncIOScheduler()
         self._setup_scheduler()
         self.scheduler.start()
         print("📅 Планировщик автоматических поздравлений активирован (проверка каждый день в 9:00)")
-        
-        # Проверяем праздники на текущий день при запуске
-        current_date = datetime.now().strftime("%d.%m.%Y")
-        print(f"🔍 Проверка праздников на текущую дату: {current_date}")
-        await self.check_and_send_greetings_for_date(current_date)
     
     def _setup_handlers(self):
         """Настройка обработчиков команд"""
@@ -90,94 +80,20 @@ class GreetingBot:
         """Проверяет, является ли пользователь админом"""
         return user_id in self.admin_ids
     
-    def _is_referral_code_unique(self, code: str) -> bool:
-        """Проверяет, уникален ли реферальный код в базе данных"""
-        try:
-            users = self.db.get_users()
-            for user in users:
-                if user.get('referral_code', '').strip() == code:
-                    return False
-            return True
-        except Exception as e:
-            print(f"[WARNING] Ошибка проверки уникальности кода: {e}")
-            return False
-    
     def _generate_referral_code(self, user_data: Dict, length: int = 11) -> str:
         """
         Генерирует уникальный реферальный код на основе личных данных пользователя
         
-        Использует комбинацию личных данных пользователя (id, name, birth_date, start_date_bank)
-        и случайной соли для создания уникального кода, который физически не может повториться.
+        Использует метод из Database для генерации кода с проверкой уникальности.
         
         Args:
             user_data: Словарь с данными пользователя (id, name, birth_date, start_date_bank)
             length: Длина кода (10-12 символов, по умолчанию 11)
         
         Returns:
-            Строка с уникальным реферальным кодом (буквы, цифры, дефисы, подчеркивания)
+            Строка с уникальным реферальным кодом
         """
-        # Используем буквы (верхний и нижний регистр), цифры, дефис и подчеркивание
-        # Исключаем похожие символы: 0, O, I, l для избежания путаницы
-        alphabet = string.ascii_letters + string.digits + '-_'
-        # Убираем похожие символы
-        alphabet = alphabet.replace('0', '').replace('O', '').replace('o', '')
-        alphabet = alphabet.replace('I', '').replace('l', '')
-        
-        # Извлекаем личные данные пользователя
-        user_id = str(user_data.get('id', ''))
-        name = str(user_data.get('name', ''))
-        birth_date = str(user_data.get('birth_date', ''))
-        start_date_bank = str(user_data.get('start_date_bank', ''))
-        
-        # Создаем уникальную строку из личных данных
-        personal_data = f"{user_id}:{name}:{birth_date}:{start_date_bank}"
-        
-        # Генерируем уникальный код с проверкой на уникальность
-        max_attempts = 100  # Максимальное количество попыток
-        for attempt in range(max_attempts):
-            # Добавляем случайную соль для дополнительной уникальности
-            random_salt = secrets.token_hex(16)
-            
-            # Создаем хеш из комбинации личных данных и соли
-            combined = f"{personal_data}:{random_salt}:{attempt}"
-            hash_obj = hashlib.sha256(combined.encode('utf-8'))
-            hash_hex = hash_obj.hexdigest()
-            
-            # Преобразуем хеш в код нужной длины
-            code_chars = []
-            hash_index = 0
-            
-            for i in range(length):
-                # Используем байты хеша для выбора символа из алфавита
-                if hash_index >= len(hash_hex) - 1:
-                    # Если хеш закончился, добавляем еще случайности
-                    hash_index = 0
-                    random_salt = secrets.token_hex(8)
-                    hash_obj = hashlib.sha256(f"{combined}:{random_salt}".encode('utf-8'))
-                    hash_hex = hash_obj.hexdigest()
-                
-                # Берем два символа хеша и преобразуем в индекс алфавита
-                hex_pair = hash_hex[hash_index:hash_index+2]
-                index = int(hex_pair, 16) % len(alphabet)
-                code_chars.append(alphabet[index])
-                hash_index += 2
-            
-            code = ''.join(code_chars)
-            
-            # Проверяем уникальность кода в базе данных
-            if self._is_referral_code_unique(code):
-                return code
-        
-        # Если не удалось сгенерировать уникальный код за max_attempts попыток,
-        # используем полностью случайный код (крайне маловероятно)
-        code = ''.join(secrets.choice(alphabet) for _ in range(length))
-        if self._is_referral_code_unique(code):
-            return code
-        
-        # В крайнем случае добавляем timestamp для гарантированной уникальности
-        timestamp = str(int(datetime.now().timestamp() * 1000000))[-6:]
-        code = ''.join(secrets.choice(alphabet) for _ in range(length - 6)) + timestamp
-        return code
+        return self.db.generate_unique_referral_code(user_data, length)
     
     def _find_user_by_referral_code(self, referral_code: str, check_used: bool = True) -> Optional[Dict]:
         """
@@ -197,8 +113,8 @@ class GreetingBot:
             
             # Если нужно проверить использование и код уже использован (есть chat_id)
             if check_used:
-                chat_id = user.get('telegram_chat_id', '') or ''
-                if chat_id.strip():
+                chat_id = user.get('telegram_chat_id')
+                if chat_id:
                     # Код уже использован
                     return None
             
@@ -213,20 +129,11 @@ class GreetingBot:
             user = self.db.get_user_by_referral_code(referral_code)
             if not user:
                 return False
-            
-            chat_id = user.get('telegram_chat_id', '') or ''
-            return bool(chat_id.strip())
+            chat_id = user.get('telegram_chat_id')
+            return bool(chat_id)
         except Exception as e:
             print(f"[ERROR] Ошибка проверки использования реферального кода: {e}")
             return False
-    
-    def _find_user_by_chat_id(self, chat_id: int) -> Optional[Dict]:
-        """Находит пользователя по telegram_chat_id"""
-        try:
-            return self.db.get_user_by_chat_id(chat_id)
-        except Exception as e:
-            print(f"[ERROR] Ошибка поиска пользователя по chat_id: {e}")
-            return None
     
     def _save_user_chat_id(self, referral_code: Optional[str] = None, chat_id: Optional[int] = None, 
                           user_id: Optional[int] = None):
@@ -237,15 +144,12 @@ class GreetingBot:
             referral_code: Реферальный код пользователя (приоритетный способ поиска)
             chat_id: Chat ID пользователя в Telegram
             user_id: User ID пользователя (резервный способ поиска)
-        
-        Returns:
-            True если успешно сохранено, False иначе
         """
         try:
             success = self.db.update_user_chat_id(
-                user_id=user_id,
                 referral_code=referral_code,
-                chat_id=chat_id
+                chat_id=chat_id,
+                user_id=user_id
             )
             
             if success:
@@ -253,7 +157,7 @@ class GreetingBot:
                 if referral_code:
                     user = self.db.get_user_by_referral_code(referral_code)
                 elif user_id:
-                    user = self.db.get_user_by_id(user_id)
+                    user = self.db.get_user_by_chat_id(chat_id) if chat_id else None
                 else:
                     user = None
                 
@@ -314,8 +218,7 @@ class GreetingBot:
         # Получаем праздники на эту дату
         holidays = self.db.get_holidays_by_date(date_yyyy_mm_dd)
         
-        # Обрабатываем дни рождения параллельно
-        birthday_tasks = []
+        # Обрабатываем дни рождения
         for user in birthdays:
             chat_id = user.get('telegram_chat_id', '').strip()
             
@@ -324,15 +227,10 @@ class GreetingBot:
                 print(f"[WARNING] Пропущен пользователь {user.get('name', 'Unknown')}: нет chat_id (пользователь не активирован)")
                 continue
             
-            # Создаем задачу для параллельного выполнения
-            task = asyncio.create_task(
-                self._send_birthday_greeting_safe(user, chat_id, date_str)
-            )
-            birthday_tasks.append(task)
-        
-        # Ждем завершения всех задач дней рождения параллельно
-        if birthday_tasks:
-            await asyncio.gather(*birthday_tasks, return_exceptions=True)
+            try:
+                await self.send_birthday_greeting(user, chat_id, date_str)
+            except Exception as e:
+                print(f"[ERROR] Ошибка отправки поздравления с днем рождения пользователю {chat_id}: {e}")
         
         # Обрабатываем праздники
         users_by_holiday = {}
@@ -341,8 +239,6 @@ class GreetingBot:
             users = self.db.get_users_for_holiday(holiday, date_yyyy_mm_dd)
             users_by_holiday[holiday_id] = users
         
-        # Обрабатываем праздники параллельно
-        holiday_tasks = []
         for holiday in holidays:
             holiday_id = holiday.get('id', '')
             users = users_by_holiday.get(holiday_id, [])
@@ -355,34 +251,12 @@ class GreetingBot:
                     print(f"[WARNING] Пропущен пользователь {user.get('name', 'Unknown')}: нет chat_id (пользователь не активирован)")
                     continue
                 
-                # Создаем задачу для параллельного выполнения
-                task = asyncio.create_task(
-                    self._send_holiday_greeting_safe(user, holiday, chat_id, date_str)
-                )
-                holiday_tasks.append(task)
-        
-        # Ждем завершения всех задач праздников параллельно
-        if holiday_tasks:
-            await asyncio.gather(*holiday_tasks, return_exceptions=True)
+                try:
+                    await self.send_holiday_greeting(user, holiday, chat_id, date_str)
+                except Exception as e:
+                    print(f"[ERROR] Ошибка отправки поздравления с праздником пользователю {chat_id}: {e}")
         
         print(f"[INFO] Проверка завершена. Обработано {len(birthdays)} дней рождения и {len(holidays)} праздников.")
-    
-    async def _send_birthday_greeting_safe(self, user: Dict, chat_id: str, event_date_str: str):
-        """Безопасная обертка для отправки поздравления с днем рождения с обработкой ошибок"""
-        try:
-            await self.send_birthday_greeting(user, chat_id, event_date_str)
-        except Exception as e:
-            print(f"[ERROR] Ошибка отправки поздравления с днем рождения пользователю {chat_id}: {e}")
-            raise
-    
-    async def _send_holiday_greeting_safe(self, user: Dict, holiday: Dict, chat_id: str, event_date_str: str):
-        """Безопасная обертка для отправки поздравления с праздником с обработкой ошибок"""
-        try:
-            await self.send_holiday_greeting(user, holiday, chat_id, event_date_str)
-        except Exception as e:
-            holiday_name = holiday.get('holiday_name', 'Unknown')
-            print(f"[ERROR] Ошибка отправки поздравления с праздником '{holiday_name}' пользователю {chat_id}: {e}")
-            raise
     
     async def send_birthday_greeting(self, user: Dict, chat_id_or_username: str, event_date_str: str):
         """Отправляет поздравление с днем рождения пользователю"""
@@ -400,7 +274,19 @@ class GreetingBot:
         
         # Генерируем поздравление
         try:
-            # Генерируем текст и изображение в отдельном потоке, чтобы не блокировать event loop
+            # Генерируем текст
+            greeting_text = generate_greeting_text(
+                event_date=event_date,
+                event_type="день рождения",
+                client_name=name,
+                client_segment=client_segment,
+                tone="дружеский",
+                preferences=[interests] if interests else None,
+                evaluate_sincerity=True,
+                min_sincerity=0.6
+            )
+            
+            # Генерируем изображение
             output_dir = Path(__file__).parent.parent / "output" / "telegram" / "auto"
             output_dir.mkdir(parents=True, exist_ok=True)
             
@@ -408,40 +294,14 @@ class GreetingBot:
             name_safe = name.replace(" ", "_")
             output_path = output_dir / f"birthday_{name_safe}_{timestamp}.png"
             
-            # Выполняем генерацию в отдельном потоке с ограничением через семафор
-            loop = asyncio.get_event_loop()
-            
-            async def generate_with_semaphore(func):
-                async with self.gigachat_semaphore:
-                    await asyncio.sleep(0.3)  # Небольшая задержка между запросами
-                    return await loop.run_in_executor(None, func)
-            
-            greeting_text, image_path = await asyncio.gather(
-                generate_with_semaphore(
-                    partial(
-                        generate_greeting_text,
-                        event_date=event_date,
-                        event_type="день рождения",
-                        client_name=name,
-                        client_segment=client_segment,
-                        tone="дружеский",
-                        preferences=[interests] if interests else None,
-                        evaluate_sincerity=True,
-                        min_sincerity=0.6
-                    )
-                ),
-                generate_with_semaphore(
-                    partial(
-                        generate_greeting_image,
-                        output_path=str(output_path),
-                        event_date=event_date,
-                        event_type="день рождения",
-                        client_name=name,
-                        client_segment=client_segment,
-                        tone="дружеский",
-                        preferences=[interests] if interests else None
-                    )
-                )
+            image_path = generate_greeting_image(
+                output_path=str(output_path),
+                event_date=event_date,
+                event_type="день рождения",
+                client_name=name,
+                client_segment=client_segment,
+                tone="дружеский",
+                preferences=[interests] if interests else None
             )
             
             # Отправляем сообщение пользователю
@@ -500,7 +360,20 @@ class GreetingBot:
             tone = "креативный"
         
         try:
-            # Генерируем текст и изображение в отдельном потоке, чтобы не блокировать event loop
+            # Генерируем текст
+            greeting_text = generate_greeting_text(
+                event_date=event_date,
+                event_type=holiday_name,
+                client_name=name,
+                position=position if position else None,
+                client_segment=client_segment,
+                tone=tone,
+                preferences=[interests] if interests else None,
+                evaluate_sincerity=True,
+                min_sincerity=0.6
+            )
+            
+            # Генерируем изображение
             output_dir = Path(__file__).parent.parent / "output" / "telegram" / "auto"
             output_dir.mkdir(parents=True, exist_ok=True)
             
@@ -509,42 +382,15 @@ class GreetingBot:
             holiday_safe = holiday_name.replace(" ", "_").replace("/", "_")
             output_path = output_dir / f"holiday_{holiday_safe}_{name_safe}_{timestamp}.png"
             
-            # Выполняем генерацию в отдельном потоке с ограничением через семафор
-            loop = asyncio.get_event_loop()
-            
-            async def generate_with_semaphore(func):
-                async with self.gigachat_semaphore:
-                    await asyncio.sleep(0.3)  # Небольшая задержка между запросами
-                    return await loop.run_in_executor(None, func)
-            
-            greeting_text, image_path = await asyncio.gather(
-                generate_with_semaphore(
-                    partial(
-                        generate_greeting_text,
-                        event_date=event_date,
-                        event_type=holiday_name,
-                        client_name=name,
-                        position=position if position else None,
-                        client_segment=client_segment,
-                        tone=tone,
-                        preferences=[interests] if interests else None,
-                        evaluate_sincerity=True,
-                        min_sincerity=0.6
-                    )
-                ),
-                generate_with_semaphore(
-                    partial(
-                        generate_greeting_image,
-                        output_path=str(output_path),
-                        event_date=event_date,
-                        event_type=holiday_name,
-                        client_name=name,
-                        position=position if position else None,
-                        client_segment=client_segment,
-                        tone=tone,
-                        preferences=[interests] if interests else None
-                    )
-                )
+            image_path = generate_greeting_image(
+                output_path=str(output_path),
+                event_date=event_date,
+                event_type=holiday_name,
+                client_name=name,
+                position=position if position else None,
+                client_segment=client_segment,
+                tone=tone,
+                preferences=[interests] if interests else None
             )
             
             # Отправляем сообщение пользователю
@@ -655,23 +501,12 @@ class GreetingBot:
                 welcome_text += f"**Текущая дата:** {datetime.now().strftime('%d.%m.%Y')}\n"
         else:
             # Обычный пользователь без реферального кода
-            # Проверяем, привязан ли пользователь (есть ли chat_id в базе)
-            user_data = self._find_user_by_chat_id(chat_id)
-            if user_data:
-                # Пользователь уже привязан
-                user_name = user_data.get('name', 'Пользователь')
-                welcome_text = (
-                    f"Привет, {user.first_name}! 👋\n\n"
-                    f"Вы уже активированы как {user_name}.\n\n"
-                    f"Бот будет автоматически отправлять вам поздравления в дни ваших праздников."
-                )
-            else:
-                # Пользователь не привязан - нужен реферальный код
-                welcome_text = (
-                    f"Привет, {user.first_name}! 👋\n\n"
-                    f"Для использования бота вам необходим реферальный код.\n\n"
-                    f"Пожалуйста, используйте ссылку, предоставленную вам администратором."
-                )
+            welcome_text = (
+                f"Привет, {user.first_name}! 👋\n\n"
+                f"Для использования бота вам необходим реферальный код.\n\n"
+                f"Пожалуйста, используйте ссылку, предоставленную вам администратором.\n\n"
+                f"Формат ссылки: `t.me/ваш_бот?start=КОД`"
+            )
         
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
     

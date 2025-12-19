@@ -5,30 +5,8 @@
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 import re
-import asyncio
-import time
 from .gigachat_module import GigaChatAPI, load_api_keys_from_env
 from .sincerity_evaluator import SincerityEvaluator
-
-
-def _is_rate_limit_error(error: Exception) -> bool:
-    """Проверяет, является ли ошибка ошибкой rate limit (429)"""
-    error_str = str(error).lower()
-    if '429' in error_str or 'too many requests' in error_str:
-        return True
-    
-    # Проверяем, если ошибка - это кортеж с HTTP статусом
-    if isinstance(error, tuple) and len(error) >= 2:
-        if error[1] == 429:
-            return True
-    
-    return False
-
-
-def _get_retry_delay(attempt: int, base_delay: float = 5.0, max_delay: float = 120.0) -> float:
-    """Вычисляет задержку для повторной попытки (экспоненциальная задержка)"""
-    delay = base_delay * (2 ** attempt)
-    return min(delay, max_delay)
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -150,19 +128,10 @@ class GigaChatTextGenerator:
         # Если ключи не переданы, загружаем из .env
         if not credentials and not api_key and (not client_id or not client_secret):
             env_credentials, env_api_key, env_client_id, env_client_secret = load_api_keys_from_env()
-            
-            # Приоритет: API_KEY/CREDENTIALS > client_id/client_secret
-            # Если есть API_KEY или CREDENTIALS, используем их и игнорируем client_id/client_secret
-            if env_credentials or env_api_key:
-                credentials = credentials or env_credentials or env_api_key
-                api_key = api_key or env_api_key
-                # Не используем client_id/client_secret, если есть API_KEY
-                client_id = None
-                client_secret = None
-            else:
-                # Используем client_id/client_secret только если нет API_KEY
-                client_id = client_id or env_client_id
-                client_secret = client_secret or env_client_secret
+            credentials = credentials or env_credentials or env_api_key
+            api_key = api_key or env_api_key
+            client_id = client_id or env_client_id
+            client_secret = client_secret or env_client_secret
         
         # Сохраняем ключи для передачи в SincerityEvaluator
         self.credentials = credentials
@@ -328,10 +297,6 @@ class GigaChatTextGenerator:
         best_text = None
         best_scores = None
         
-        # Отдельный счетчик для обработки ошибки 429
-        rate_limit_retries = 0
-        max_rate_limit_retries = 5  # Больше попыток для ошибки 429
-        
         for attempt in range(max_retries + 1):
             try:
                 # Используем chat API для генерации текста (без function_call)
@@ -342,8 +307,6 @@ class GigaChatTextGenerator:
                 }
                 
                 response = self.api.client.chat(chat_payload)
-                # Сбрасываем счетчик ошибок 429 при успешном запросе
-                rate_limit_retries = 0
                 
                 # Извлекаем текст из ответа
                 if hasattr(response, 'choices') and len(response.choices) > 0:
@@ -448,32 +411,11 @@ class GigaChatTextGenerator:
                     raise Exception(f"Неожиданный формат ответа от GigaChat API: {response}")
                     
             except Exception as e:
-                # Проверяем, является ли это ошибкой rate limit (429)
-                if _is_rate_limit_error(e):
-                    rate_limit_retries += 1
-                    if rate_limit_retries > max_rate_limit_retries:
-                        raise Exception(
-                            f"Ошибка 429 (Too Many Requests) при генерации текста после {max_rate_limit_retries} попыток.\n"
-                            f"Возможно, исчерпана квота токенов или превышен rate limit.\n"
-                            f"Попробуйте позже или проверьте квоту API."
-                        )
-                    
-                    delay = _get_retry_delay(rate_limit_retries - 1)  # Используем отдельный счетчик для задержки
-                    print(f"[WARNING] Ошибка 429 (Too Many Requests) при попытке {rate_limit_retries}/{max_rate_limit_retries}: {e}")
-                    print(f"[INFO] Ожидание {delay:.1f} секунд перед повторной попыткой...")
-                    time.sleep(delay)
-                    # Продолжаем цикл, не увеличивая attempt
-                    continue
-                
-                # Для других ошибок проверяем обычный лимит попыток
                 if attempt >= max_retries:
                     raise Exception(f"Ошибка генерации текста через GigaChat: {e}")
-                
-                print(f"[WARNING] Ошибка при попытке {attempt + 1}: {e}, пробую еще раз...")
-                # Небольшая задержка для других ошибок
-                time.sleep(1.0)
-                
-                continue
+                else:
+                    print(f"[WARNING] Ошибка при попытке {attempt + 1}: {e}, пробую еще раз...")
+                    continue
         
         # Если дошли сюда, возвращаем лучший вариант (или последний, если оценка не включена)
         if best_text:

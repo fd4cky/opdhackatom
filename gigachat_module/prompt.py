@@ -71,19 +71,10 @@ class GigaChatPrompt:
         # Если ключи не переданы, загружаем из .env
         if not credentials and not api_key and (not client_id or not client_secret):
             env_credentials, env_api_key, env_client_id, env_client_secret = load_api_keys_from_env()
-            
-            # Приоритет: API_KEY/CREDENTIALS > client_id/client_secret
-            # Если есть API_KEY или CREDENTIALS, используем их и игнорируем client_id/client_secret
-            if env_credentials or env_api_key:
-                credentials = credentials or env_credentials or env_api_key
-                api_key = api_key or env_api_key
-                # Не используем client_id/client_secret, если есть API_KEY
-                client_id = None
-                client_secret = None
-            else:
-                # Используем client_id/client_secret только если нет API_KEY
-                client_id = client_id or env_client_id
-                client_secret = client_secret or env_client_secret
+            credentials = credentials or env_credentials or env_api_key
+            api_key = api_key or env_api_key
+            client_id = client_id or env_client_id
+            client_secret = client_secret or env_client_secret
         
         self.api = GigaChatAPI(
             credentials=credentials,
